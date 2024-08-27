@@ -4,13 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from pathlib import Path
-
 import pytest
-from torchtune.data._types import Message
+from tests.common import ASSETS
+from torchtune.data._messages import Message
 from torchtune.models.llama3 import llama3_tokenizer, Llama3Tokenizer
-
-ASSETS = Path(__file__).parent.parent.parent.parent / "assets"
 
 
 class TestLlama3Tokenizer:
@@ -400,7 +397,7 @@ class TestLlama3Tokenizer:
         with pytest.raises(
             ValueError, match="<|begin_of_text|> missing from special_tokens"
         ):
-            tokenizer = Llama3Tokenizer(
+            _ = Llama3Tokenizer(
                 path=str(ASSETS / "tiktoken_small.model"),
                 # Same as LLAMA3_SPECIAL_TOKENS but one missing
                 special_tokens={
