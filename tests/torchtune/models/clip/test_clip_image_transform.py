@@ -4,18 +4,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+
 import numpy as np
 import PIL
 import pytest
 
 import torch
+
 from tests.test_utils import assert_expected
 
-from torchtune.models.clip._transforms import CLIPImageTransform
-from torchtune.models.clip.inference._transforms import (
+from torchtune.models.clip._transform import CLIPImageTransform
+from torchtune.models.clip.inference._transform import (
     CLIPImageTransform as CLIPImageTransformInference,
 )
-from torchtune.utils.seed import set_seed
+from torchtune.training.seed import set_seed
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +55,7 @@ class TestCLIPImageTransform:
                 "expected_tile_max": [0.9922, 0.9926, 0.9970, 0.9908],
                 "expected_tile_min": [0.0056, 0.0069, 0.0059, 0.0033],
                 "expected_aspect_ratio": [2, 2],
+                "pad_tiles": 1,
             },
             {
                 "image_size": (600, 200, 3),
@@ -74,6 +77,7 @@ class TestCLIPImageTransform:
             possible_resolutions=None,
             max_num_tiles=4,
             resample="bilinear",
+            dtype=torch.float32,
             resize_to_max_canvas=params["resize_to_max_canvas"],
         )
 
@@ -98,7 +102,7 @@ class TestCLIPImageTransform:
         image = PIL.Image.fromarray(image)
 
         # Apply the transformation
-        output = image_transform(image=image)
+        output = image_transform({"image": image})
         output_image = output["image"]
         output_ar = output["aspect_ratio"]
 

@@ -7,8 +7,10 @@
 from typing import Dict, List, Optional, Union
 
 import torch
-from torch import nn, Tensor
+from torch import nn
 from torchtune.modules import TransformerDecoder
+from torchtune.modules.model_fusion._fusion_utils import get_fusion_params
+from torchtune.modules.peft._utils import set_trainable_params
 
 
 class FusionLayer(nn.Module):
@@ -62,7 +64,7 @@ class FusionLayer(nn.Module):
         # TODO: Switch to register_load_state_dict_pre_hook and
         # register_state_dict_pre_hook after PyTorch v2.5
 
-    def _state_dict_hook(self, state_dict, *args, **kwargs):
+    def _state_dict_hook(self, state_dict, prefix, *args, **kwargs):
         """Remove "layer" from the original layer in the state_dict
         name. This keeps the orginal state dict name for the layer
         from before fusing with the FusionLayer.
@@ -71,36 +73,67 @@ class FusionLayer(nn.Module):
         """
         keys = list(state_dict.keys())
         for key in keys:
-            if key.startswith("layer"):
-                new_key = key.replace("layer.", "")
+            local_key = key[len(prefix) :]
+            if local_key.startswith("layer"):
+                new_key = prefix + local_key.replace("layer.", "")
                 state_dict[new_key] = state_dict[key]
                 del state_dict[key]
 
-    def _load_state_dict_hook(self, state_dict, *args, **kwargs):
+    def _load_state_dict_hook(self, state_dict, prefix, *args, **kwargs):
         """Apply extra "layer" prefix to the state_dict key to
         account for the FusionLayer wrapping.
         """
         keys = list(state_dict.keys())
         for key in keys:
-            if not key.startswith("fusion_layer"):
-                new_key = "layer." + key
+            local_key = key[len(prefix) :]
+            if not local_key.startswith("fusion_layer"):
+                new_key = prefix + "layer." + local_key
                 state_dict[new_key] = state_dict[key]
                 del state_dict[key]
 
-    def setup_cache(self, batch_size: int, dtype: torch.dtype) -> None:
+    def setup_caches(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        *,
+        encoder_max_seq_len: int,
+        decoder_max_seq_len: int,
+    ) -> None:
         """Setup key value cache for both layers.
 
         Args:
             batch_size (int): batch size for the caches.
             dtype (torch.dtype): dtype for the caches.
+            encoder_max_seq_len (int): maximum cache sequence length for cross-attention layer.
+            decoder_max_seq_len (int): maximum cache sequence length for self-attention layer.
         """
-        self.layer.setup_cache(batch_size, dtype)
-        self.fusion_layer.setup_cache(batch_size, dtype)
+        self.layer.setup_caches(
+            batch_size,
+            dtype,
+            encoder_max_seq_len=encoder_max_seq_len,
+            decoder_max_seq_len=decoder_max_seq_len,
+        )
 
-    @property
-    def cache_enabled(self) -> bool:
-        """Check if the key value caches are setup."""
-        return self.layer.cache_enabled
+        self.fusion_layer.setup_caches(
+            batch_size,
+            dtype,
+            encoder_max_seq_len=encoder_max_seq_len,
+            decoder_max_seq_len=decoder_max_seq_len,
+        )
+
+    def caches_are_setup(self) -> bool:
+        """
+        Check if the key value caches are setup on ``self.layer``.
+        See :func:~torchtune.modules.TransformerDecoder.caches_are_setup`.
+        """
+        return self.layer.caches_are_setup()
+
+    def caches_are_enabled(self) -> bool:
+        """
+        Checks if the key value caches on ``self.layer`` are enabled.
+        See :func:~torchtune.modules.TransformerDecoder.caches_are_enabled`.
+        """
+        return self.layer.caches_are_enabled()
 
     def reset_cache(self):
         """Reset both layers' key value caches."""
@@ -116,10 +149,10 @@ class FusionLayer(nn.Module):
         ]
         return fusion_params
 
-    def forward(self, x: Tensor, **kwargs: Dict) -> Tensor:
+    def forward(self, x: torch.Tensor, **kwargs: Dict) -> torch.Tensor:
         """
         Args:
-            x (Tensor): input tensor with shape
+            x (torch.Tensor): input tensor with shape
                 [batch_size x seq_length x embed_dim]
             **kwargs (Dict): all additional layer args
 
@@ -147,7 +180,7 @@ class FusionEmbedding(nn.Module):
     second embedding for the additional tokens. During forward this module routes
     the tokens to the appropriate embedding table.
 
-    Use this as a drop-in replacement for `nn.Embedding` in your model.
+    Use this as a drop-in replacement for :class:`torch.nn.Embedding` in your model.
 
     Example:
         >>> embedding = FusionEmbedding(vocab_size=100, fusion_vocab_size=10, embed_dim=128)
@@ -190,19 +223,20 @@ class FusionEmbedding(nn.Module):
 
         [!Note] This update changes the order of the OrderedDict
         """
-        key = "embedding.weight"
-        new_key = "weight"
+        key = prefix + "embedding.weight"
+        new_key = prefix + "weight"
         destination[new_key] = destination[key]
         del destination[key]
 
-    def _load_state_dict_hook(self, state_dict, *args, **kwargs):
+    def _load_state_dict_hook(self, state_dict, prefix, *args, **kwargs):
         """Apply extra "embedding" prefix to the state_dict key to
         account for the FusionEmbedding wrapping.
         """
-        key = "weight"
-        new_key = "embedding.weight"
-        state_dict[new_key] = state_dict[key]
-        del state_dict[key]
+        if state_dict:
+            key = prefix + "weight"
+            new_key = prefix + "embedding.weight"
+            state_dict[new_key] = state_dict[key]
+            del state_dict[key]
 
     def fusion_params(self) -> List[str]:
         """
@@ -219,10 +253,10 @@ class FusionEmbedding(nn.Module):
         dtype = self.embedding.weight.dtype
         return torch.empty(bs, seq_len, self.dim, device=device, dtype=dtype)
 
-    def forward(self, input: Tensor) -> Tensor:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            input (Tensor): input integer tensor with shape
+            input (torch.Tensor): input integer tensor with shape
                 [batch_size x seq_length]
 
         Returns:
@@ -247,8 +281,8 @@ class FusionEmbedding(nn.Module):
         # [batch_size x seq_length x embed_dim]
         out = self._fused_embed(bs, seq_len)
         mask = mask.unsqueeze(-1).expand(bs, seq_len, self.dim)
-        out.masked_scatter_(mask, embeds)
-        out.masked_scatter_(~mask, fusion_embeds)
+        out = out.masked_scatter(mask, embeds)
+        out = out.masked_scatter(~mask, fusion_embeds)
         return out
 
 
@@ -260,7 +294,7 @@ class DeepFusionModel(nn.Module):
     This module has the same methods and forward signature as :class:`~torchtune.modules.TransformerDecoder` and can be used
     interchangeably where :class:`~torchtune.modules.TransformerDecoder` is. It combines the encoder with the decoder as a
     single module for checkpointing and finetuning. It is expected that the encoder and decoder
-    are already defined with any extra learnable ``fusion_params``; learnable parameters to help
+    are already defined with any extra learnable ``fusion_params``: learnable parameters to help
     adapt the pre-trained encoder to the pre-trained decoder.
 
     Example:
@@ -293,58 +327,120 @@ class DeepFusionModel(nn.Module):
     Args:
         decoder (TransformerDecoder): decoder module
         encoder (nn.Module): encoder module
+        decoder_trainable (bool): whether to train or freeze the decoder. Default is False.
+        encoder_trainable (bool): whether to train or freeze the encoder. Default is False.
+        fusion_trainable (bool): whether to train the fusion parameters. Default is True.
+
     """
 
     def __init__(
         self,
         decoder: TransformerDecoder,
         encoder: nn.Module,
+        *,
+        decoder_trainable: bool = False,
+        encoder_trainable: bool = False,
+        fusion_trainable: bool = True,
     ):
         super().__init__()
         self.decoder = decoder
         self.encoder = encoder
 
-    def setup_caches(self, batch_size: int, dtype: torch.dtype) -> None:
-        """Setup key value caches for attention calculation.
+        trainable_params = set()
+        if encoder_trainable:
+            trainable_params |= {
+                f"encoder.{n}" for n, p in self.encoder.named_parameters()
+            }
+        if decoder_trainable:
+            trainable_params |= {
+                f"decoder.{n}" for n, p in self.decoder.named_parameters()
+            }
+        if fusion_trainable:
+            trainable_params |= set(get_fusion_params(self))
+        else:
+            trainable_params -= set(get_fusion_params(self))
+        set_trainable_params(self, trainable_params)
+
+    def set_num_output_chunks(self, num_output_chunks: int) -> None:
+        """Used to save memory in combination with :class:`~torchtune.modules.loss.CEWithChunkedOutputLoss`.
+        This should be called before the first forward pass, in the recipe."""
+        self.decoder.set_num_output_chunks(num_output_chunks)
+
+    def setup_caches(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        *,
+        encoder_max_seq_len: int = None,
+        decoder_max_seq_len: int = None,
+    ):
+        """
+        Sets up key-value attention caches for inference for ``self.decoder``.
+        For each layer in ``self.decoder.layers``:
+        - :class:`torchtune.modules.TransformerSelfAttentionLayer` will use ``decoder_max_seq_len``.
+        - :class:`torchtune.modules.TransformerCrossAttentionLayer` will use ``encoder_max_seq_len``.
+        - :class:`torchtune.modules.fusion.FusionLayer` will use both ``decoder_max_seq_len`` and ``encoder_max_seq_len``.
 
         Args:
             batch_size (int): batch size for the caches.
             dtype (torch.dtype): dtype for the caches.
+            encoder_max_seq_len (int): maximum encoder cache sequence length.
+            decoder_max_seq_len (int): maximum decoder cache sequence length.
         """
-        self.decoder.setup_caches(batch_size, dtype)
+        self.decoder.setup_caches(
+            batch_size,
+            dtype,
+            encoder_max_seq_len=encoder_max_seq_len,
+            decoder_max_seq_len=decoder_max_seq_len,
+        )
+
+    def caches_are_setup(self) -> bool:
+        """
+        Check if the key value caches are setup. This means ``setup_caches`` has been called, and
+        the relevant attention modules in the model have created their ``KVCache``.
+        """
+        return self.decoder.caches_are_setup()
 
     def caches_are_enabled(self) -> bool:
-        """Check if the key value caches are setup."""
+        """
+        Checks if the key value caches are enabled. Once KV-caches have been setup, the relevant
+        attention modules will be "enabled" and all forward passes will update the caches. This behaviour
+        can be disabled without altering the state of the KV-caches by "disabling" the KV-caches
+        using :func:`~torchtune.modules.common_utils.disable_kv_cache`, upon which ``caches_are_enabled`` would return False.
+        """
         return self.decoder.caches_are_enabled()
 
     def reset_caches(self):
-        """Reset the key value caches."""
+        """
+        Resets KV-cache buffers on relevant attention modules to zero, and reset cache positions to zero,
+        without deleting or reallocating cache tensors.
+        """
         self.decoder.reset_caches()
 
     def forward(
         self,
-        tokens: Tensor,
+        tokens: torch.Tensor,
         *,
-        mask: Optional[Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
         encoder_input: Optional[Dict] = None,
-        encoder_mask: Optional[Tensor] = None,
-        input_pos: Optional[Tensor] = None,
-    ) -> Union[Tensor, List[Tensor]]:
+        encoder_mask: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
-            tokens (Tensor): input tensor with shape [b x s]
-            mask (Optional[Tensor]): Optional boolean tensor which contains the attention mask
-                with shape [b x s x s]. This is applied after the query-key multiplication and
+            tokens (torch.Tensor): input tensor with shape ``[b x s]``
+            mask (Optional[torch.Tensor]): Optional boolean tensor which contains the attention mask
+                with shape ``[b x s x s]``. This is applied after the query-key multiplication and
                 before the softmax. A value of True in row i and column j means token i attends
                 to token j. A value of False means token i does not attend to token j. If no
                 mask is specified, a causal mask is used by default. Default is None.
             encoder_input (Optional[Dict]): Optional input for the encoder.
-            encoder_mask (Optional[Tensor]):  Boolean tensor defining a relational matrix between
+            encoder_mask (Optional[torch.Tensor]):  Boolean tensor defining a relational matrix between
                 tokens and encoder embeddings. A True value at position i,j means token i can attend
-                to embedding j in the decoder. Mask has shape [b x s x s_e]. Default is None.
-            input_pos (Optional[Tensor]): Optional tensor which contains the position ids
+                to embedding j in the decoder. Mask has shape ``[b x s x s_e]``. Default is None.
+            input_pos (Optional[torch.Tensor]): Optional tensor which contains the position ids
                 of each token. During training, this is used to indicate the positions
-                of each token relative to its sample when packed, shape [b x s].
+                of each token relative to its sample when packed, shape ``[b x s]``.
                 During inference, this indicates the position of the current token.
                 If none, assume the index of the token is its position id. Default is None.
 
@@ -354,8 +450,8 @@ class DeepFusionModel(nn.Module):
         KV values for each position.
 
         Returns:
-            Tensor: output tensor with shape [b x s x v] or a list of layer
-                output tensors defined by ``output_hidden_states`` with the
+            Tensor: output tensor with shape ``[b x s x v]`` or a list of layer \
+                output tensors defined by ``output_hidden_states`` with the \
                 final output tensor appended to the list.
 
         Notation used for tensor shapes:
@@ -374,10 +470,6 @@ class DeepFusionModel(nn.Module):
         if encoder_input is not None:
             encoder_embed = self.encoder(**encoder_input)
 
-        # input_pos specifies the sequence position of the provided tokens
-        # we slice the encoder_mask to only include those same positions
-        if input_pos is not None and encoder_mask is not None:
-            encoder_mask = encoder_mask[:, input_pos]
         output = self.decoder(
             tokens=tokens,
             mask=mask,

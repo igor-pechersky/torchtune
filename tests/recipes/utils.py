@@ -13,9 +13,9 @@ import torch
 from torch.utils.data import Dataset
 
 CKPT_COMPONENT_MAP = {
-    "tune": "torchtune.utils.FullModelTorchTuneCheckpointer",
-    "meta": "torchtune.utils.FullModelMetaCheckpointer",
-    "hf": "torchtune.utils.FullModelHFCheckpointer",
+    "tune": "torchtune.training.FullModelTorchTuneCheckpointer",
+    "meta": "torchtune.training.FullModelMetaCheckpointer",
+    "hf": "torchtune.training.FullModelHFCheckpointer",
 }
 
 
@@ -49,6 +49,17 @@ def get_assets_path():
     return Path(__file__).parent.parent / "assets"
 
 
+def dummy_stack_exchange_dataset_config():
+    data_files = os.path.join(get_assets_path(), "stack_exchange_paired_tiny.json")
+    out = [
+        "dataset._component_=torchtune.datasets.stack_exchange_paired_dataset",
+        "dataset.source='json'",
+        f"dataset.data_files={data_files}",
+        "dataset.split='train'",
+    ]
+    return out
+
+
 def dummy_alpaca_dataset_config():
     data_files = os.path.join(get_assets_path(), "alpaca_tiny.json")
     out = [
@@ -72,7 +83,6 @@ def dummy_text_completion_alpaca_dataset_config():
         f"dataset.data_files={data_files}",
         "dataset.column='instruction'",
         "dataset.split='train[:10%]'",  # 10% of the dataset gets us 8 batches
-        "dataset.max_seq_len=64",
         "dataset.add_eos=False",
     ]
     return out
@@ -125,6 +135,7 @@ def lora_llama2_test_config(
     lora_rank: int = 8,
     lora_alpha: float = 16,
     quantize_base: bool = False,
+    use_dora: bool = False,
 ) -> List[str]:
     return [
         # Note: we explicitly use _component_ so that we can also call
@@ -144,6 +155,7 @@ def lora_llama2_test_config(
         f"model.lora_alpha={lora_alpha}",
         "model.lora_dropout=0.0",
         f"model.quantize_base={quantize_base}",
+        f"model.use_dora={use_dora}",
     ]
 
 
@@ -196,6 +208,14 @@ MODEL_TEST_CONFIGS = {
         apply_lora_to_output=False,
         lora_rank=8,
         lora_alpha=16,
+    ),
+    "llama2_dora": lora_llama2_test_config(
+        lora_attn_modules=["q_proj", "k_proj", "v_proj", "output_proj"],
+        apply_lora_to_mlp=False,
+        apply_lora_to_output=False,
+        lora_rank=8,
+        lora_alpha=16,
+        use_dora=True,
     ),
     "llama2_qlora": lora_llama2_test_config(
         lora_attn_modules=["q_proj", "k_proj", "v_proj", "output_proj"],

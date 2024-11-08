@@ -109,6 +109,9 @@ class Llama2Tokenizer(ModelTokenizer, Transform):
     def tokenize_messages(
         self,
         messages: List[Message],
+        *,
+        add_start_tokens: bool = True,
+        add_end_tokens: bool = True,
     ) -> Tuple[List[int], List[bool]]:
         r"""Tokenize a list of messages one at a time then concatenate them,
         returning a list of tokens and a list of masks.
@@ -139,6 +142,9 @@ class Llama2Tokenizer(ModelTokenizer, Transform):
         Args:
             messages (List[Message]): A list of messages, each containing role, content,
                 and masked attributes.
+            add_start_tokens (bool): Whether to add BOS token to the beginning of the first message.
+                Default True.
+            add_end_tokens (bool): Whether to add EOS token to the end of the last message. Default True.
 
         Returns:
             Tuple[List[int], List[bool]]: The tokenized messages
@@ -151,25 +157,27 @@ class Llama2Tokenizer(ModelTokenizer, Transform):
         return tokenize_messages_no_special_tokens(
             tokenizer=self,
             messages=templated_messages,
-            bos_id=self.bos_id,
-            eos_id=self.eos_id,
-            max_seq_len=self.max_seq_len,
+            bos_id=self.bos_id if add_start_tokens else None,
+            eos_id=self.eos_id if add_end_tokens else None,
         )
 
-    def __call__(self, sample: Mapping[str, Any]) -> Mapping[str, Any]:
+    def __call__(
+        self, sample: Mapping[str, Any], inference: bool = False
+    ) -> Mapping[str, Any]:
         """
         Apply ``tokenize_messages`` to the "messages" field in the sample.
 
         Args:
             sample (Mapping[str, Any]): A sample with a "messages" field containing
                 a List[Message] to tokenize
+            inference (bool): Whether the template is being used for inference or not.
 
         Returns:
             Mapping[str, Any]: The sample with added "tokens" and "mask" fields
                 and the "messages" field removed.
         """
         messages = sample.pop("messages")
-        tokens, mask = self.tokenize_messages(messages)
+        tokens, mask = self.tokenize_messages(messages, add_end_tokens=not inference)
         sample["tokens"] = tokens
         sample["mask"] = mask
         return sample

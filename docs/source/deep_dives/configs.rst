@@ -119,7 +119,7 @@ keyword arguments not specified in the config if we'd like:
         tokenizer: ModelTokenizer,
         train_on_input: bool = True,
         max_seq_len: int = 512,
-    ) -> InstructDataset:
+    ) -> SFTDataset:
 
     from torchtune import config
 
@@ -147,7 +147,7 @@ will automatically resolve it for you.
 
     output_dir: /tmp/alpaca-llama2-finetune
     metric_logger:
-      _component_: torchtune.utils.metric_logging.DiskLogger
+      _component_: torchtune.training.metric_logging.DiskLogger
       log_dir: ${output_dir}
 
 Validating your config

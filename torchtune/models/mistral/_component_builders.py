@@ -4,23 +4,22 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from functools import partial
-from torchtune.modules.common_utils import reparametrize_as_dtype_state_dict_post_hook
 from typing import List
 
 from torch import nn
 
 from torchtune.modules import (
-    MultiHeadAttention,
     FeedForward,
     FrozenNF4Linear,
+    MultiHeadAttention,
     RMSNorm,
     RotaryPositionalEmbeddings,
     TransformerDecoder,
     TransformerSelfAttentionLayer,
 )
+from torchtune.modules.common_utils import _register_reparametrize_state_dict_hooks
 
-from torchtune.modules.peft import LORA_ATTN_MODULES, LoRALinear
+from torchtune.modules.peft import DoRALinear, LORA_ATTN_MODULES, LoRALinear
 
 """
 Component builders for the Mistral 7B models and popular variants such as LoRA.
@@ -79,7 +78,9 @@ def mistral(
     head_dim = embed_dim // num_heads
     num_kv_heads = num_kv_heads if num_kv_heads else num_heads
 
-    rope = RotaryPositionalEmbeddings(dim=head_dim, max_seq_len=max_seq_len, base=rope_base)
+    rope = RotaryPositionalEmbeddings(
+        dim=head_dim, max_seq_len=max_seq_len, base=rope_base
+    )
     self_attn = MultiHeadAttention(
         embed_dim=embed_dim,
         num_heads=num_heads,
@@ -119,9 +120,21 @@ def mistral_mlp(dim: int, hidden_dim: int, quantize_base: bool = False) -> FeedF
     """
     Build the MLP layer associated with the Mistral model.
     """
-    gate_proj = nn.Linear(dim, hidden_dim, bias=False) if not quantize_base else FrozenNF4Linear(dim, hidden_dim, bias=False)
-    down_proj = nn.Linear(hidden_dim, dim, bias=False) if not quantize_base else FrozenNF4Linear(hidden_dim, dim, bias=False)
-    up_proj = nn.Linear(dim, hidden_dim, bias=False) if not quantize_base else FrozenNF4Linear(dim, hidden_dim, bias=False)
+    gate_proj = (
+        nn.Linear(dim, hidden_dim, bias=False)
+        if not quantize_base
+        else FrozenNF4Linear(dim, hidden_dim, bias=False)
+    )
+    down_proj = (
+        nn.Linear(hidden_dim, dim, bias=False)
+        if not quantize_base
+        else FrozenNF4Linear(hidden_dim, dim, bias=False)
+    )
+    up_proj = (
+        nn.Linear(dim, hidden_dim, bias=False)
+        if not quantize_base
+        else FrozenNF4Linear(dim, hidden_dim, bias=False)
+    )
     return FeedForward(gate_proj=gate_proj, down_proj=down_proj, up_proj=up_proj)
 
 
@@ -145,6 +158,7 @@ def lora_mistral(
     lora_rank: int,
     lora_alpha: float,
     lora_dropout: float = 0.0,
+    use_dora: bool = False,
     quantize_base: bool = False,
 ) -> TransformerDecoder:
     """
@@ -176,6 +190,8 @@ def lora_mistral(
         lora_rank (int): rank of each low-rank approximation
         lora_alpha (float): scaling factor for the low-rank approximation
         lora_dropout (float): LoRA dropout probability. Default: 0.0
+        use_dora (bool): Decompose the LoRA weight into magnitude and direction, as
+            introduced in "DoRA: Weight-Decomposed Low-Rank Adaptation" (https://arxiv.org/abs/2402.09353).
         quantize_base: (bool): Whether to quantize base model weights or not. Only applied to base
             weights within linear layers LoRA is applied to. The final output linear projection is not
             supported for quantization currently.
@@ -197,6 +213,7 @@ def lora_mistral(
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
+        use_dora=use_dora,
         quantize_base=quantize_base,
     )
 
@@ -207,10 +224,13 @@ def lora_mistral(
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
+            use_dora=use_dora,
             quantize_base=quantize_base,
         )
     else:
-        mlp = mistral_mlp(dim=embed_dim, hidden_dim=intermediate_dim, quantize_base=quantize_base)
+        mlp = mistral_mlp(
+            dim=embed_dim, hidden_dim=intermediate_dim, quantize_base=quantize_base
+        )
 
     layer = TransformerSelfAttentionLayer(
         attn=self_attn,
@@ -222,8 +242,9 @@ def lora_mistral(
     tok_embeddings = nn.Embedding(vocab_size, embed_dim)
 
     # TODO: quantize_base is not applied to final output_proj currently.
+    adapter_cls = DoRALinear if use_dora else LoRALinear
     output_proj = (
-        LoRALinear(embed_dim, vocab_size, rank=lora_rank, alpha=lora_alpha)
+        adapter_cls(embed_dim, vocab_size, rank=lora_rank, alpha=lora_alpha)
         if apply_lora_to_output
         else nn.Linear(embed_dim, vocab_size, bias=False)
     )
@@ -241,15 +262,9 @@ def lora_mistral(
     if quantize_base:
         # For QLoRA, we reparametrize 4-bit tensors to higher precision, and offload to CPU on the fly
         # so as to not increase peak memory
-        model._register_state_dict_hook(
-            partial(
-                reparametrize_as_dtype_state_dict_post_hook,
-                # TODO this is clowny, figure out a better way to get what precision the rest
-                # of the model is in
-                dtype=tok_embeddings.weight.dtype,
-                offload_to_cpu=True,
-            )
-        )
+        # TODO this is clowny, figure out a better way to get what precision the rest
+        # of the model is in
+        _register_reparametrize_state_dict_hooks(model, dtype=tok_embeddings.weight.dtype)
 
     return model
 
@@ -268,6 +283,7 @@ def lora_mistral_self_attention(
     lora_rank: int,
     lora_alpha: float,
     lora_dropout: float = 0.0,
+    use_dora: bool = False,
     quantize_base: bool = False,
 ) -> MultiHeadAttention:
     """
@@ -291,6 +307,8 @@ def lora_mistral_self_attention(
         lora_rank (int): rank of each low-rank approximation
         lora_alpha (float): scaling factor for the low-rank approximation
         lora_dropout (float): LoRA dropout probability. Default: 0.0
+        use_dora (bool): Decompose the LoRA weight into magnitude and direction, as
+            introduced in "DoRA: Weight-Decomposed Low-Rank Adaptation" (https://arxiv.org/abs/2402.09353).
         quantize_base (bool): Whether to quantize base model parameters for linear layers
             LoRA is being applied to. Default is ``False``.
 
@@ -302,13 +320,16 @@ def lora_mistral_self_attention(
         ValueError: If lora_modules arg is an empty list
     """
     if not lora_modules:
-        raise ValueError(f"Must pass one or more of {LORA_ATTN_MODULES} as lora_modules")
+        raise ValueError(
+            f"Must pass one or more of {LORA_ATTN_MODULES} as lora_modules"
+        )
 
     head_dim = embed_dim // num_heads
     num_kv_heads = num_kv_heads if num_kv_heads else num_heads
+    adapter_cls = DoRALinear if use_dora else LoRALinear
 
     q_proj = (
-        LoRALinear(
+        adapter_cls(
             embed_dim,
             num_heads * head_dim,
             rank=lora_rank,
@@ -324,7 +345,7 @@ def lora_mistral_self_attention(
         )
     )
     k_proj = (
-        LoRALinear(
+        adapter_cls(
             embed_dim,
             num_kv_heads * head_dim,
             rank=lora_rank,
@@ -340,7 +361,7 @@ def lora_mistral_self_attention(
         )
     )
     v_proj = (
-        LoRALinear(
+        adapter_cls(
             embed_dim,
             num_kv_heads * head_dim,
             rank=lora_rank,
@@ -356,7 +377,7 @@ def lora_mistral_self_attention(
         )
     )
     output_proj = (
-        LoRALinear(
+        adapter_cls(
             embed_dim,
             embed_dim,
             rank=lora_rank,
@@ -371,7 +392,9 @@ def lora_mistral_self_attention(
             else FrozenNF4Linear(embed_dim, embed_dim, bias=False)
         )
     )
-    rope = RotaryPositionalEmbeddings(dim=head_dim, max_seq_len=max_seq_len, base=rope_base)
+    rope = RotaryPositionalEmbeddings(
+        dim=head_dim, max_seq_len=max_seq_len, base=rope_base
+    )
     self_attn = MultiHeadAttention(
         embed_dim=embed_dim,
         num_heads=num_heads,
@@ -395,9 +418,11 @@ def lora_mistral_mlp(
     lora_rank: int,
     lora_alpha: float,
     lora_dropout: float = 0.0,
+    use_dora: bool = False,
     quantize_base: bool = False,
 ) -> FeedForward:
-    gate_proj = LoRALinear(
+    adapter_cls = DoRALinear if use_dora else LoRALinear
+    gate_proj = adapter_cls(
         in_dim=dim,
         out_dim=hidden_dim,
         rank=lora_rank,
@@ -405,7 +430,7 @@ def lora_mistral_mlp(
         dropout=lora_dropout,
         quantize_base=quantize_base,
     )
-    down_proj = LoRALinear(
+    down_proj = adapter_cls(
         in_dim=hidden_dim,
         out_dim=dim,
         rank=lora_rank,
@@ -413,7 +438,7 @@ def lora_mistral_mlp(
         dropout=lora_dropout,
         quantize_base=quantize_base,
     )
-    up_proj = LoRALinear(
+    up_proj = adapter_cls(
         in_dim=dim,
         out_dim=hidden_dim,
         rank=lora_rank,
@@ -471,7 +496,9 @@ def mistral_classifier(
     head_dim = embed_dim // num_heads
     num_kv_heads = num_kv_heads if num_kv_heads else num_heads
 
-    rope = RotaryPositionalEmbeddings(dim=head_dim, max_seq_len=max_seq_len, base=rope_base)
+    rope = RotaryPositionalEmbeddings(
+        dim=head_dim, max_seq_len=max_seq_len, base=rope_base
+    )
     self_attn = MultiHeadAttention(
         embed_dim=embed_dim,
         num_heads=num_heads,
@@ -529,6 +556,7 @@ def lora_mistral_classifier(
     lora_rank: int,
     lora_alpha: float,
     lora_dropout: float = 0.0,
+    use_dora: bool = False,
     quantize_base: bool = False,
 ) -> TransformerDecoder:
     """
@@ -561,6 +589,8 @@ def lora_mistral_classifier(
         lora_rank (int): rank of each low-rank approximation
         lora_alpha (float): scaling factor for the low-rank approximation
         lora_dropout (float): LoRA dropout probability. Default: 0.0
+        use_dora (bool): Decompose the LoRA weight into magnitude and direction, as
+            introduced in "DoRA: Weight-Decomposed Low-Rank Adaptation" (https://arxiv.org/abs/2402.09353).
         quantize_base: (bool): Whether to quantize base model weights or not. Only applied to base
             weights within linear layers LoRA is applied to. The final output linear projection is not
             supported for quantization currently.
@@ -582,6 +612,7 @@ def lora_mistral_classifier(
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
+        use_dora=use_dora,
         quantize_base=quantize_base,
     )
 
@@ -592,6 +623,7 @@ def lora_mistral_classifier(
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
+            use_dora=use_dora,
             quantize_base=quantize_base,
         )
     else:
@@ -607,8 +639,15 @@ def lora_mistral_classifier(
     tok_embeddings = nn.Embedding(vocab_size, embed_dim)
 
     # TODO: quantize_base is not applied to final output_proj currently.
+    adapter_cls = DoRALinear if use_dora else LoRALinear
     output_proj = (
-        LoRALinear(embed_dim, num_classes, rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
+        adapter_cls(
+            embed_dim,
+            num_classes,
+            rank=lora_rank,
+            alpha=lora_alpha,
+            dropout=lora_dropout,
+        )
         if apply_lora_to_output
         else nn.Linear(embed_dim, num_classes, bias=False)
     )
@@ -626,14 +665,8 @@ def lora_mistral_classifier(
     if quantize_base:
         # For QLoRA, we reparametrize 4-bit tensors to higher precision, and offload to CPU on the fly
         # so as to not increase peak memory
-        model._register_state_dict_hook(
-            partial(
-                reparametrize_as_dtype_state_dict_post_hook,
-                # TODO this is clowny, figure out a better way to get what precision the rest
-                # of the model is in
-                dtype=tok_embeddings.weight.dtype,
-                offload_to_cpu=True,
-            )
-        )
+        # TODO this is clowny, figure out a better way to get what precision the rest
+        # of the model is in
+        _register_reparametrize_state_dict_hooks(model, dtype=tok_embeddings.weight.dtype)
 
     return model

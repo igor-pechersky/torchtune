@@ -10,7 +10,7 @@ import torch
 from tests.test_utils import assert_expected, fixed_init_model
 from torch import nn
 from torchtune.modules.model_fusion import FusionLayer
-from torchtune.utils.seed import set_seed
+from torchtune.training.seed import set_seed
 
 
 @pytest.fixture(autouse=True)
@@ -18,14 +18,40 @@ def random():
     set_seed(1)
 
 
-class DummyLayer(nn.Module):
+class DummyCrossAttentionLayer(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.linear = nn.Linear(dim, dim)
         self.cache_enabled = False
+        self.encoder_max_seq_len = None
 
-    def setup_cache(self, batch_size, dtype):
+    def setup_caches(self, batch_size, dtype, encoder_max_seq_len, decoder_max_seq_len):
         self.cache_enabled = True
+        self.encoder_max_seq_len = encoder_max_seq_len
+
+    def caches_are_enabled(self):
+        return self.cache_enabled
+
+    def reset_cache(self):
+        self.cache_enabled = False
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class DummySelfAttentionLayer(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim)
+        self.cache_enabled = False
+        self.decoder_max_seq_len = None
+
+    def setup_caches(self, batch_size, dtype, encoder_max_seq_len, decoder_max_seq_len):
+        self.cache_enabled = True
+        self.decoder_max_seq_len = decoder_max_seq_len
+
+    def caches_are_enabled(self):
+        return self.cache_enabled
 
     def reset_cache(self):
         self.cache_enabled = False
@@ -45,13 +71,13 @@ class TestFusionLayer:
 
     @pytest.fixture
     def layer(self, dim) -> nn.Module:
-        layer = DummyLayer(dim)
+        layer = DummySelfAttentionLayer(dim)
         fixed_init_model(layer, min_val=-0.1, max_val=0.1)
         return layer
 
     @pytest.fixture
     def fusion_layer(self, dim) -> nn.Module:
-        layer = DummyLayer(dim)
+        layer = DummyCrossAttentionLayer(dim)
         fixed_init_model(layer, min_val=-0.2, max_val=0.2)
         return layer
 
@@ -111,11 +137,25 @@ class TestFusionLayer:
             "fusion_layer.linear.bias",
         }
 
-    def test_setup_cache(self, fused_layer):
+    def test_setup_caches(self, fused_layer):
         """
         Test that the cache methods works as expected.
         """
-        fused_layer.setup_cache(2, torch.float32)
-        assert fused_layer.cache_enabled
-        fused_layer.reset_cache()
-        assert not fused_layer.cache_enabled
+        fused_layer.setup_caches(
+            2, torch.float32, encoder_max_seq_len=10, decoder_max_seq_len=10
+        )
+        assert fused_layer.caches_are_enabled()
+
+    def test_setup_cache_different_cache_seq_len(self, fused_layer):
+        """
+        Test that the cache methods works as expected.
+        """
+        fused_layer.setup_caches(
+            2, torch.float32, encoder_max_seq_len=5, decoder_max_seq_len=10
+        )
+
+        assert fused_layer.layer.decoder_max_seq_len == 10
+        assert fused_layer.fusion_layer.encoder_max_seq_len == 5
+
+        assert not hasattr(fused_layer.layer, "encoder_max_seq_len")
+        assert not hasattr(fused_layer.fusion_layer, "decoder_max_seq_len")

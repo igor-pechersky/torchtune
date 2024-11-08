@@ -6,6 +6,8 @@
 from functools import partial
 from typing import Dict, List, Protocol, Tuple, Union
 
+from torchtune.config._utils import _get_component_from_path
+
 from torchtune.data._messages import Message, Role
 
 _TemplateType = Union[str, Dict[Role, Tuple[str, str]]]
@@ -25,6 +27,7 @@ class PromptTemplateInterface(Protocol):
     def __call__(
         self,
         messages: List[Message],
+        inference: bool = False,
     ) -> List[Message]:
         """
         Format each role's message(s) according to the prompt template
@@ -32,6 +35,7 @@ class PromptTemplateInterface(Protocol):
         Args:
             messages (List[Message]): a single conversation, structured as a list
                 of :class:`~torchtune.data.Message` objects
+            inference (bool): Whether the template is being used for inference or not.
 
         Returns:
             The formatted list of messages
@@ -87,29 +91,33 @@ class PromptTemplate(PromptTemplateInterface):
     ):
         self.template = template
 
-    def __call__(self, messages: List[Message]) -> List[Message]:
+    def __call__(
+        self, messages: List[Message], inference: bool = False
+    ) -> List[Message]:
         """
         Format each role's message(s) according to the prompt template by prepending
         and appending the defined tags.
 
         Args:
             messages (List[Message]): list of messages to apply the template to
+            inference (bool): Whether the template is being used for inference or not.
 
         Returns:
             List[Message]: The formatted list of messages
         """
         formatted_dialogue = []
         for message in messages:
+            content = message.content
             if message.role in self.template:
                 prepend_tag = self.template[message.role][0]
                 append_tag = self.template[message.role][1]
-                content = (
-                    [{"type": "text", "content": prepend_tag}]
-                    + message.content
-                    + [{"type": "text", "content": append_tag}]
-                )
-            else:
                 content = message.content
+
+                if isinstance(prepend_tag, str) and len(prepend_tag) > 0:
+                    content = [{"type": "text", "content": prepend_tag}] + content
+
+                if isinstance(append_tag, str) and len(append_tag) > 0:
+                    content = content + [{"type": "text", "content": append_tag}]
             formatted_dialogue.append(
                 Message(
                     role=message.role,
@@ -151,6 +159,7 @@ class ChatMLTemplate(PromptTemplateInterface):
     def __call__(
         self,
         messages: List[Message],
+        inference: bool = False,
     ) -> List[Message]:
         """
         Format user, assistant, and system messages with appropriate tags.
@@ -158,6 +167,7 @@ class ChatMLTemplate(PromptTemplateInterface):
         Args:
             messages (List[Message]): a single conversation, structured as a list
                 of `Message` objects
+            inference (bool): Whether the template is being used for inference or not.
 
         Returns:
             The formatted list of messages
@@ -174,13 +184,20 @@ class ChatMLTemplate(PromptTemplateInterface):
                 and index == len(messages) - 1
                 and len(message.text_content) == 0
             ):
-                content = [{"type": "text", "content": prepend_tag}] + message.content
+                content = message.content
+                if isinstance(prepend_tag, str) and len(prepend_tag) > 0:
+                    content = [
+                        {"type": "text", "content": prepend_tag}
+                    ] + message.content
             else:
-                content = (
-                    [{"type": "text", "content": prepend_tag}]
-                    + message.content
-                    + [{"type": "text", "content": append_tag}]
-                )
+                content = message.content
+
+                if isinstance(prepend_tag, str) and len(prepend_tag) > 0:
+                    content = [{"type": "text", "content": prepend_tag}] + content
+
+                if isinstance(append_tag, str) and len(append_tag) > 0:
+                    content = content + [{"type": "text", "content": append_tag}]
+
             formatted_dialogue.append(
                 Message(
                     role=message.role,
@@ -240,3 +257,32 @@ A prompt template for question answering tasks::
 
 Please see :class:`~torchtune.data.PromptTemplate` for full API arguments.
 """
+
+
+def _get_prompt_template(
+    prompt_template: _TemplateType,
+) -> PromptTemplateInterface:
+    """
+    Retrieve prompt template from import dotpath or create a custom one with provided
+    template dictionary.
+
+    Args:
+        prompt_template (_TemplateType): optional specified prompt template.
+            If a string, it is assumed to be the dotpath of a :class:`~torchtune.data.PromptTemplateInterface`
+            class. If a dictionary, it is assumed to be a custom prompt template mapping role to the
+            prepend/append tags.
+
+    Returns:
+        PromptTemplateInterface: the specified prompt template
+
+    Raises:
+        ValueError: If a string or dictionary is not passed in
+    """
+    if isinstance(prompt_template, str):
+        return _get_component_from_path(prompt_template)()
+    elif isinstance(prompt_template, dict):
+        return PromptTemplate(prompt_template)
+    else:
+        raise ValueError(
+            f"Prompt template must be a dotpath string or dictionary with custom template, got {type(prompt_template)}"
+        )

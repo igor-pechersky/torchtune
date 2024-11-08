@@ -145,10 +145,14 @@ class DummyTokenizer(ModelTokenizer, Transform):
         return tokenized_messages, mask
 
     def __call__(self, sample: Mapping[str, Any]) -> Mapping[str, Any]:
-        messages = sample.pop("messages")
+        messages: List[Message] = sample.pop("messages")
+        images = []
+        for message in messages:
+            images += message.get_media()
         tokens, mask = self.tokenize_messages(messages)
         sample["tokens"] = tokens
         sample["mask"] = mask
+        sample["images"] = images
         return sample
 
     @property
@@ -162,32 +166,6 @@ class DummyTokenizer(ModelTokenizer, Transform):
     @property
     def image_id(self):
         return -2
-
-
-class DummyChatFormat:
-
-    B_SYS, E_SYS = "System:\n", "\n"
-    B_INST, E_INST = "User:\n", "\nAssistant:\n"
-    B_ASST, E_ASST = "", ""
-    system = f"{B_SYS}{{content}}{E_SYS}"
-    user = f"{B_INST}{{content}}{E_INST}"
-    assistant = f"{B_ASST}{{content}}{E_ASST}"
-
-    @classmethod
-    def format(
-        cls,
-        messages,
-    ):
-        formats = {"system": cls.system, "user": cls.user, "assistant": cls.assistant}
-        formatted_dialogue = []
-        for message in messages:
-            content = formats.get(message.role).format(
-                content=message.content[0]["content"]
-            )
-            formatted_dialogue.append(
-                Message(role=message.role, content=content, masked=message.masked),
-            )
-        return formatted_dialogue
 
 
 DummyPromptTemplate = partial(
@@ -358,3 +336,11 @@ def assert_dialogue_equal(actual, expected):
     for i in range(len(actual)):
         assert actual[i].role == expected[i].role
         assert actual[i].text_content == expected[i].text_content
+
+
+def mps_ignored_test() -> bool:
+    return pytest.mark.skipif(
+        torch.backends.mps.is_available() and torch.backends.mps.is_built(),
+        reason="Test skipped due to torch being compiled with MPS"
+        "see https://github.com/pytorch/torchtune/issues/1707 for more information",
+    )

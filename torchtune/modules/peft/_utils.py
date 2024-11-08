@@ -7,6 +7,7 @@
 import contextlib
 from typing import Any, Dict, Generator, List, Literal, Optional, Protocol, Set
 
+import torch
 from torch import nn
 
 # Modules from MultiHeadAttention that LoRA can be applied to
@@ -15,14 +16,14 @@ LORA_ATTN_MODULES = Literal["q_proj", "k_proj", "v_proj", "output_proj"]
 
 class AdapterModule(Protocol):
     """
-    Interface for an nn.Module containing adapter weights.
+    Interface for an ``nn.Module`` containing adapter weights.
     Note that an adapter module does not have to explicitly implement this protocol,
     but it must define the ``adapter_params(self)`` method.
     """
 
     def adapter_params(self) -> List[str]:
         """
-        Return a list of strings corresponding to the names of the nn.Parameters in
+        Return a list of strings corresponding to the names of the ``nn.Parameter`` s in
         the model coming from the adapter.
         E.g. if an nn.Module has adapter ``self.proj = nn.Linear(in_dim, out_dim)``,
         then adapter_params should return ``['proj.weight', 'proj.bias']``.
@@ -151,7 +152,12 @@ def validate_state_dict_for_lora(
     lora_modules = get_lora_module_names(
         lora_attn_modules, apply_lora_to_mlp, apply_lora_to_output
     )
-    is_lora_param = lambda x: any([".".join([k, "lora"]) in x for k in lora_modules])
+    is_lora_param = lambda x: any(
+        [
+            ".".join([k, "lora"]) in x or ".".join([k, "magnitude"]) in x
+            for k in lora_modules
+        ]
+    )
     for k in full_model_state_dict_keys:
         if not is_lora_param(k):
             if base_model_state_dict_keys is not None:
@@ -200,17 +206,22 @@ def _get_lora_modules(state_dict: Dict[str, Any]) -> Set[str]:
     Returns:
         Set[str]: Set of keys in the state dict that correspond to LoRA modules.
     """
-    lora_keys = [k for k in state_dict.keys() if "lora" in k]
+    lora_keys = [k for k in state_dict.keys() if "lora" in k or "magnitude" in k]
     return set(
         [
-            k.replace(".lora_a.weight", "").replace(".lora_b.weight", "")
+            k.replace(".lora_a.weight", "")
+            .replace(".lora_b.weight", "")
+            .replace(".magnitude", "")
             for k in lora_keys
         ]
     )
 
 
+@torch.no_grad
 def get_merged_lora_ckpt(
-    state_dict: Dict[str, Any], rank: int, alpha: float
+    state_dict: Dict[str, Any],
+    rank: int,
+    alpha: float,
 ) -> Dict[str, Any]:
     """
     Merge LoRA weights into the base model format for efficient inference.
@@ -218,8 +229,7 @@ def get_merged_lora_ckpt(
     make a copy prior to calling this function.
 
     For every LoRA module in the state dict, this function will convert its
-    weight -> weight + (alpha / rank) * lora_b @ lora_a,
-    then delete the lora_a and lora_b weights.
+    base weight then delete the LoRA-specific parameters.
 
     Args:
         state_dict (Dict[str, Any]): State dict from a model.
@@ -233,26 +243,46 @@ def get_merged_lora_ckpt(
     for module in lora_modules:
         lora_a_weight = state_dict[f"{module}.lora_a.weight"]
         lora_b_weight = state_dict[f"{module}.lora_b.weight"]
-        state_dict[f"{module}.weight"] += (alpha / rank) * lora_b_weight @ lora_a_weight
+        lora_magnitude = state_dict.get(f"{module}.magnitude", None)
+
+        # If magnitude is present, calculate merged DoRA weight
+        if lora_magnitude is not None:
+            base_weight = state_dict[f"{module}.weight"].to(lora_a_weight.dtype)
+
+            lora_weight = (alpha / rank) * lora_b_weight @ lora_a_weight
+            merged_weight = base_weight + lora_weight
+            weight_norm = torch.linalg.norm(base_weight + lora_weight, dim=1)
+            mag_norm_scale = (lora_magnitude / weight_norm).view(-1, 1)
+            merged_weight *= mag_norm_scale
+            state_dict[f"{module}.weight"] = merged_weight
+            del state_dict[f"{module}.magnitude"]
+
+        # Otherwise it is just vanilla LoRA
+        else:
+            state_dict[f"{module}.weight"] += (
+                (alpha / rank) * lora_b_weight @ lora_a_weight
+            )
+
         del state_dict[f"{module}.lora_a.weight"]
         del state_dict[f"{module}.lora_b.weight"]
+
     return state_dict
 
 
 @contextlib.contextmanager
 def disable_adapter(model: nn.Module) -> Generator[None, None, None]:
     """
-    Temporarily disable the adapters in a neural network model. This can be used,
-    for example, in DPO for treating the lora adapters as the policy model
+    Temporarily disable the adapters in a model. For example,
+    this can be used in DPO for treating the LoRA adapters as the policy model
     and disabling it to treat the base model as the reference model.
 
     This context manager goes through all modules in the provided neural network model,
-    and if a module has an 'adapter_params' attribute that is callable and a 'disabled' attribute,
-    it sets 'disabled' to True. Then, the control is given back to caller. Once that finalizes,
-    it sets 'disabled' back to False for all modules that were temporarily disabled.
+    and if a module has an ``adapter_params`` attribute that is callable and a ``disabled`` attribute,
+    it sets ``disabled`` to True. Then, the control is given back to caller. When exiting the context manager,
+    it sets ``disabled`` back to False for all modules that were temporarily disabled.
 
     Args:
-        model (nn.Module): The neural network model whose adapters are to be temporarily disabled.
+        model (nn.Module): The model whose adapters are to be temporarily disabled.
     Yields:
         None: This function yields control back to the caller, with the adapters disabled.
     Example:
@@ -297,8 +327,6 @@ def validate_missing_and_unexpected_for_lora(
     Unlike that function, this method relies only on the values of missing and unexpected
     as returned by the load_state_dict API with strict=False. This allows us to do the
     validation without any additional calls to .state_dict(), which use additional memory.
-    This API should only be used for single-device recipes, or on multi-device after
-    https://github.com/pytorch/pytorch/pull/120600.
 
     Args:
         lora_attn_modules (List[LORA_ATTN_MODULES]): list of which linear layers
@@ -327,7 +355,13 @@ def validate_missing_and_unexpected_for_lora(
     lora_modules = get_lora_module_names(
         lora_attn_modules, apply_lora_to_mlp, apply_lora_to_output
     )
-    is_lora_param = lambda x: any([".".join([k, "lora"]) in x for k in lora_modules])
+    is_lora_param = lambda x: any(
+        [
+            ".".join([k, "lora"]) in x or ".".join([k, "magnitude"]) in x
+            for k in lora_modules
+        ]
+    )
+
     if base_missing:
         for k in base_missing:
             if not is_lora_param(k):
@@ -340,3 +374,14 @@ def validate_missing_and_unexpected_for_lora(
                 raise AssertionError(f"Missing LoRA key {k} from adapter state dict")
     if lora_unexpected:
         raise AssertionError("Unexpected key loading adapter")
+
+
+def load_dora_magnitudes(model: nn.Module) -> None:
+    """
+    For DoRA magnitude we use setattr to move from meta device
+    """
+    dora_parents = {
+        n: p for n, p in model.named_modules() if hasattr(p, "adapter_params")
+    }
+    sd = {f"{n}.magnitude": p.magnitude for n, p in dora_parents.items()}
+    model.load_state_dict(sd, strict=False, assign=True)
