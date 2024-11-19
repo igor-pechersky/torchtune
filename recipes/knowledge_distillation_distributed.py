@@ -25,6 +25,7 @@ from torchtune.datasets import ConcatDataset
 from torchtune.modules.peft import (
     DoRALinear,
     get_adapter_params,
+    get_adapter_state_dict,
     get_lora_module_names,
     get_merged_lora_ckpt,
     load_dora_magnitudes,
@@ -513,10 +514,12 @@ class KDRecipeDistributed(FTRecipeInterface):
 
         if self._is_rank_zero:
             log.info(
-                f"Instantiating model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs"
+                f"Instantiating student model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs"
             )
             memory_stats = training.get_memory_stats(device=self._device)
-            training.log_memory_stats(memory_stats)
+            training.log_memory_stats(
+                memory_stats, message="Memory stats after student model init:"
+            )
 
         # synchronize before training begins
         torch.distributed.barrier()
@@ -598,7 +601,9 @@ class KDRecipeDistributed(FTRecipeInterface):
                 f"Instantiating teacher model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs"
             )
             memory_stats = training.get_memory_stats(device=self._device)
-            training.log_memory_stats(memory_stats)
+            training.log_memory_stats(
+                memory_stats, message="Memory stats after teacher model init:"
+            )
 
         # synchronize before training begins
         torch.distributed.barrier()
@@ -707,8 +712,8 @@ class KDRecipeDistributed(FTRecipeInterface):
         intermediate_checkpoint = epoch + 1 < self.total_epochs
         # To prevent GPU memory from spiking during checkpoint save,
         # we consolidate the full model and optim state dicts on CPU for rank 0
-        cpu_state_dict = training.get_full_model_state_dict(
-            self._model,
+        cpu_state_dict = training.gather_cpu_state_dict(
+            self._model.state_dict(),
             self._is_rank_zero,
             device=self._device,
         )
@@ -728,10 +733,7 @@ class KDRecipeDistributed(FTRecipeInterface):
 
             # Filter out the adapter keys and weights from the model state dict. These will
             # be saved separately
-            adapter_key_filter = lambda x: x in self.adapter_params
-            adapter_state_dict = {
-                k: v for k, v in cpu_state_dict.items() if adapter_key_filter(k)
-            }
+            adapter_state_dict = get_adapter_state_dict(cpu_state_dict)
             checkpoint_dict.update({training.ADAPTER_KEY: adapter_state_dict})
 
             # merge the adapter weights and base weights to create the model checkpoint
