@@ -11,9 +11,9 @@ from datasets import load_dataset
 from torch.utils.data import Dataset
 
 from torchtune.data import ChosenRejectedToMessages, CROSS_ENTROPY_IGNORE_IDX
-
-from torchtune.modules.tokenizers import ModelTokenizer
 from torchtune.modules.transforms import Transform
+
+from torchtune.modules.transforms.tokenizers import ModelTokenizer
 
 
 class PreferenceDataset(Dataset):
@@ -84,14 +84,19 @@ class PreferenceDataset(Dataset):
             of messages are stored in the ``"chosen"`` and ``"rejected"`` keys.
         tokenizer (ModelTokenizer): Tokenizer used by the model that implements the ``tokenize_messages`` method.
             Since PreferenceDataset only supports text data, it requires a
-            :class:`~torchtune.modules.tokenizers.ModelTokenizer` instead of the ``model_transform`` in
+            :class:`~torchtune.modules.transforms.tokenizers.ModelTokenizer` instead of the ``model_transform`` in
             :class:`~torchtune.datasets.SFTDataset`.
         filter_fn (Optional[Callable]): callable used to filter the dataset prior to any pre-processing. See
             the Hugging Face `docs <https://huggingface.co/docs/datasets/v2.20.0/process#select-and-filter>`_ for more
             details.
+        packed (bool): Whether or not to pack the dataset to ``max_seq_len`` prior to training. Default is False. Packed is
+            currently not supported for ``PreferenceDataset`` and a ``ValueError`` will be raised if this is set to True.
         **load_dataset_kwargs (Dict[str, Any]): additional keyword arguments to pass to ``load_dataset``. See Hugging
             Face's `API ref <https://huggingface.co/docs/datasets/en/package_reference/loading_methods#datasets.load_dataset>`_
             for more details.
+
+    Raises:
+        ValueError: If ``packed`` is True, this feature is not supported for ``PreferenceDataset``.
     """
 
     def __init__(
@@ -101,8 +106,14 @@ class PreferenceDataset(Dataset):
         message_transform: Transform,
         tokenizer: ModelTokenizer,
         filter_fn: Optional[Callable] = None,
+        packed: bool = False,
         **load_dataset_kwargs: Dict[str, Any],
     ) -> None:
+        if packed:
+            raise ValueError(
+                "Packed is currently not supported for preference datasets."
+            )
+
         self._tokenizer = tokenizer
         self._message_transform = message_transform
         self._data = load_dataset(source, **load_dataset_kwargs)

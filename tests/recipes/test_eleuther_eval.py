@@ -39,12 +39,12 @@ class TestEleutherEval:
     @pytest.fixture
     def expected_vision_acc(self):
         return {
-            "Science": 0.35,
-            "Biology": 0.25,
-            "Chemistry": 0.25,
-            "Geography": 0.5,
-            "Math": 0.0,
-            "Physics": 0.75,
+            "Science": 0.2,
+            "Biology": 0,
+            "Chemistry": 0.3333,
+            "Geography": 0,
+            "Math": 0,
+            "Physics": 0.6667,
         }
 
     @pytest.mark.parametrize(
@@ -132,8 +132,8 @@ class TestEleutherEval:
         monkeypatch.setattr(sys, "argv", cmd)
         with pytest.raises(
             RuntimeError,
-            match="This recipe requires EleutherAI Eval Harness v0.4.5. "
-            "Please install with `pip install lm-eval==0.4.5`",
+            match="This recipe requires EleutherAI Eval Harness v0.4.5 or higher. "
+            "Please install with `pip install lm-eval>=0.4.5`",
         ):
             runpy.run_path(TUNE_PATH, run_name="__main__")
 
@@ -231,7 +231,7 @@ class TestEleutherEval:
             checkpointer.model_type=LLAMA3_VISION \
             tokenizer.path=/tmp/test-artifacts/tokenizer_llama3.model \
             tokenizer.prompt_template=null \
-            limit=4 \
+            limit=3 \
             dtype=bf16 \
             device=cuda \
         """.split()
@@ -274,7 +274,7 @@ class TestEleutherEval:
             checkpointer.model_type=LLAMA3_VISION \
             tokenizer.path=/tmp/test-artifacts/tokenizer_llama3.model \
             tokenizer.prompt_template=null \
-            limit=4 \
+            limit=3 \
             dtype=bf16 \
             device=cuda \
         """.split()

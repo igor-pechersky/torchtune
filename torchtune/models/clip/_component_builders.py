@@ -8,12 +8,13 @@ from functools import partial
 from typing import Callable, List, Optional
 
 from torch import nn
+
 from torchtune.models.clip._position_embeddings import (
     TiledTokenPositionalEmbedding,
     TilePositionalEmbedding,
     TokenPositionalEmbedding,
 )
-
+from torchtune.models.clip._text_encoder import CLIPTextEncoder, QuickGELU
 from torchtune.modules import (
     FeedForward,
     Fp32LayerNorm,
@@ -22,11 +23,8 @@ from torchtune.modules import (
     TransformerSelfAttentionLayer,
     VisionRotaryPositionalEmbeddings,
 )
-
 from torchtune.modules.common_utils import reparametrize_as_dtype_state_dict_post_hook
-
 from torchtune.modules.peft import DoRALinear, LORA_ATTN_MODULES, LoRALinear
-
 from torchtune.modules.vision_transformer import CLSProjection, VisionTransformer
 
 
@@ -45,6 +43,7 @@ def clip_vision_encoder(
     max_num_tiles: int = 4,
     in_channels: int = 3,
     append_cls_token: bool = False,
+    use_tile_pos_embed: bool = True,
 ) -> VisionTransformer:
     """
     Builds the vision encoder associated with the clip model. This includes:
@@ -80,6 +79,8 @@ def clip_vision_encoder(
         in_channels (int): The number of image input channels.
         append_cls_token (bool): If True, adds CLS token embedding to the end of the sequence in the vision transformer.
             Default is False, which adds CLS token to the beginning of the sequence.
+        use_tile_pos_embed (bool): If True, use pre-tile, post-tile, and tiled token positional embeddings, if max_num_tiles > 1.
+            If False, only use standard token positional embeddings.
 
     Returns:
         A `VisionTransformer` object.
@@ -90,10 +91,6 @@ def clip_vision_encoder(
     if embed_dim % num_heads != 0:
         raise ValueError(
             f"embed_dim must be divisible by num_heads, got {embed_dim} and {num_heads}"
-        )
-    if use_rope and max_num_tiles != 1:
-        raise ValueError(
-            f"2D RoPE is only supported for max_num_tiles = 1, got {max_num_tiles}"
         )
 
     head_dim = embed_dim // num_heads
@@ -107,6 +104,7 @@ def clip_vision_encoder(
         VisionRotaryPositionalEmbeddings(
             patch_size=patch_size,
             tile_size=tile_size,
+            max_num_tiles=max_num_tiles,
             dim=head_dim // 2,
             base=10_000,
             append_cls_token=append_cls_token,
@@ -145,13 +143,7 @@ def clip_vision_encoder(
     )
 
     # position embeddings
-    if max_num_tiles == 1:
-        pre_tile_pos_embed = None
-        post_tile_pos_embed = None
-        token_pos_embedding = TokenPositionalEmbedding(
-            embed_dim=embed_dim, patch_size=patch_size, tile_size=tile_size
-        )
-    else:
+    if use_tile_pos_embed and max_num_tiles > 1:
         pre_tile_pos_embed = TilePositionalEmbedding(
             max_num_tiles=max_num_tiles, embed_dim=embed_dim
         )
@@ -163,6 +155,12 @@ def clip_vision_encoder(
             embed_dim=embed_dim,
             patch_size=patch_size,
             tile_size=tile_size,
+        )
+    else:
+        pre_tile_pos_embed = None
+        post_tile_pos_embed = None
+        token_pos_embedding = TokenPositionalEmbedding(
+            embed_dim=embed_dim, patch_size=patch_size, tile_size=tile_size
         )
 
     return VisionTransformer(
@@ -178,6 +176,65 @@ def clip_vision_encoder(
         embed_dim=embed_dim,
         in_channels=in_channels,
         append_cls_token=append_cls_token,
+    )
+
+
+def clip_text_encoder(
+    embed_dim: int,
+    num_heads: int,
+    num_layers: int,
+    vocab_size: int = 49408,
+    max_seq_len: int = 77,
+    norm_eps: float = 1e-5,
+):
+    """
+    Text encoder for CLIP.
+
+    CLIP is a model that encodes text and images into a shared vector space.
+    Blog post: https://openai.com/index/clip/
+    Paper: https://arxiv.org/abs/2103.00020
+
+    Args:
+        embed_dim (int): embedding/model dimension size
+        num_heads (int): number of attention heads
+        num_layers (int): number of transformer layers
+        vocab_size (int): size of the vocabulary, default 49408
+        max_seq_len (int): context size, default 77
+        norm_eps (float): small value added to denominator for numerical stability, default 1e-5
+
+    Returns:
+        CLIPTextEncoder
+    """
+    attn = MultiHeadAttention(
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+        head_dim=embed_dim // num_heads,
+        q_proj=nn.Linear(embed_dim, embed_dim),
+        k_proj=nn.Linear(embed_dim, embed_dim),
+        v_proj=nn.Linear(embed_dim, embed_dim),
+        output_proj=nn.Linear(embed_dim, embed_dim),
+    )
+    mlp = clip_mlp(
+        in_dim=embed_dim,
+        out_dim=embed_dim,
+        hidden_dim=embed_dim * 4,
+        activation=QuickGELU(),
+    )
+    encoder_layer = TransformerSelfAttentionLayer(
+        attn=attn,
+        mlp=mlp,
+        sa_norm=nn.LayerNorm(embed_dim, eps=norm_eps),
+        mlp_norm=nn.LayerNorm(embed_dim, eps=norm_eps),
+    )
+    final_norm = nn.LayerNorm(embed_dim, eps=norm_eps)
+    return CLIPTextEncoder(
+        layer=encoder_layer,
+        final_norm=final_norm,
+        vocab_size=vocab_size,
+        max_seq_len=max_seq_len,
+        embed_dim=embed_dim,
+        num_layers=num_layers,
     )
 
 

@@ -10,7 +10,7 @@ from torchtune.data import ShareGPTToMessages
 from torchtune.datasets._packed import PackedDataset
 
 from torchtune.datasets._sft import SFTDataset
-from torchtune.modules.tokenizers import ModelTokenizer
+from torchtune.modules.transforms.tokenizers import ModelTokenizer
 
 
 def slimorca_dataset(
@@ -65,7 +65,7 @@ def slimorca_dataset(
         ValueError: If ``packed=True`` and ``tokenizer.max_seq_len`` is not set.
 
     Example:
-        >>> ds = slimorca_dataset(model_transform=tokenizer)
+        >>> ds = slimorca_dataset(tokenizer=tokenizer)
         >>> for input, label in ds:
         >>>     print(input)
         >>>     print(label)
